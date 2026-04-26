@@ -1,0 +1,164 @@
+================================================================
+  CONTENT BROADCASTING SYSTEM — ARCHITECTURE NOTES
+================================================================
+
+1. AUTHENTICATION & RBAC FLOW
+-------------------------------
+- JWT (JSON Web Token) is used for stateless authentication.
+- On login/register, server signs a token containing: { id, email, role }
+- Token is valid for 7 days (configurable via JWT_EXPIRES_IN).
+- Every protected route passes through the `authenticate` middleware which:
+    1. Reads Authorization: Bearer <token> header
+    2. Verifies the token using JWT_SECRET
+    3. Attaches decoded payload to req.user
+- Role enforcement is done via the `authorize(...roles)` middleware factory:
+    - authorize("teacher")   → only teachers pass
+    - authorize("principal") → only principal passes
+- Roles are stored in the users table and embedded in the JWT payload.
+- No sensitive data (password_hash) is ever returned in responses.
+
+2. SUBJECT-BASED SYSTEM DESIGN
+--------------------------------
+- Every content upload is tagged with a subject (maths, science, etc.)
+- A content_slots table tracks unique (subject, teacher_id) pairs.
+- This enables per-teacher, per-subject independent broadcast rotation.
+- When a teacher uploads content:
+    1. A slot is created (or reused) for that subject + teacher combo
+    2. Content is linked to the slot via content_schedule
+    3. rotation_order is auto-incremented within the slot
+- Subject names are normalized to lowercase on all writes and reads.
+
+3. UPLOAD HANDLING APPROACH
+-----------------------------
+- Multer handles multipart/form-data file uploads.
+- Storage: local disk at src/uploads/ (configurable via UPLOAD_DIR).
+- File validation (fileFilter):
+    - Allowed MIME types: image/jpeg, image/png, image/gif
+    - Allowed extensions: .jpg, .jpeg, .png, .gif
+    - Both MIME and extension are checked to prevent spoofing.
+- File size limit: 10MB (configurable via MAX_FILE_SIZE env var).
+- Stored filename: {timestamp}-{random}.ext (no original name to avoid collisions).
+- file_url is exposed publicly via Express static middleware (/uploads/*).
+- file_path is stored internally for server-side access.
+
+4. APPROVAL WORKFLOW DESIGN
+-----------------------------
+Status lifecycle: uploaded → pending → approved / rejected
+
+- All uploaded content starts as 'pending'.
+- Only the Principal role can approve or reject.
+- Approval: sets status='approved', approved_by, approved_at
+- Rejection: sets status='rejected', stores rejection_reason (mandatory)
+- Rejected content stays visible to the teacher with the reason shown.
+- Only approved content is eligible for broadcasting.
+- Re-submission of rejected content is not in scope (can be added).
+
+5. SCHEDULING / ROTATION LOGIC (MOST IMPORTANT)
+-------------------------------------------------
+The public endpoint GET /content/live/:teacherId uses this algorithm:
+
+Step 1 — Fetch eligible content
+  Query all content where:
+    - uploaded_by = teacherId
+    - status = 'approved'
+    - start_time IS NOT NULL AND end_time IS NOT NULL
+    - start_time <= NOW() AND end_time >= NOW()
+
+Step 2 — Group by subject
+  Each subject has its own independent rotation queue.
+  Items are ordered by rotation_order (set at upload time).
+
+Step 3 — Determine active item per subject
+  - Epoch = earliest start_time among active items for that subject
+  - elapsed_minutes = floor((NOW - epoch) / 60000)
+  - total_cycle = sum of all duration values in this subject's queue
+  - position_in_cycle = elapsed_minutes % total_cycle
+  - Walk the list accumulating durations until position_in_cycle falls
+    within an item's time slot → that item is currently ACTIVE
+
+Step 4 — Return
+  - One active item per subject (or single item if subject filter applied)
+  - If no eligible content: return "No content available" with empty array
+
+Edge Cases Handled:
+  - No approved content → empty response
+  - Approved but no time window set → not eligible (excluded by query)
+  - Approved with time window, but outside window → not eligible
+  - Invalid teacherId (non-integer or non-existent) → empty response
+  - Invalid/unknown subject in query → empty response
+
+6. DATABASE DESIGN DECISIONS
+------------------------------
+Tables: users, content, content_slots, content_schedule
+
+- users: stores both principal and teacher, role enforced via CHECK constraint
+- content: central table with full lifecycle fields (status, timestamps, file info)
+- content_slots: represents a broadcast channel per (subject, teacher) pair
+    - UNIQUE constraint prevents duplicate slots
+- content_schedule: links content to slots with rotation ordering
+    - rotation_order enables deterministic sequencing
+    - duration enables variable time-slice per content item
+- Foreign keys with ON DELETE CASCADE ensure no orphan records
+- TIMESTAMPTZ used throughout for timezone-aware scheduling
+
+7. FOLDER STRUCTURE
+---------------------
+src/
+├── server.js           → Express app entry, route mounting, middleware setup
+├── config/
+│   └── db.js           → PostgreSQL pool (pg library)
+├── controllers/
+│   ├── auth.controller.js      → register, login, me
+│   ├── content.controller.js   → upload, my content, single content
+│   ├── approval.controller.js  → all, pending, approve, reject
+│   └── broadcast.controller.js → public live endpoint
+├── routes/
+│   ├── auth.routes.js
+│   ├── content.routes.js
+│   ├── approval.routes.js
+│   └── broadcast.routes.js
+├── services/
+│   └── scheduling.service.js   → core rotation algorithm
+├── middlewares/
+│   ├── auth.middleware.js       → authenticate, authorize
+│   └── upload.middleware.js     → multer config + error handler
+├── models/
+│   ├── migrate.js              → creates all tables
+│   └── seed.js                 → default principal + teacher accounts
+├── utils/
+│   ├── jwt.js                  → signToken, verifyToken
+│   └── response.js             → success/error helpers
+└── uploads/                    → local file storage
+
+8. MIDDLEWARE USAGE
+--------------------
+- cors()                  → allows cross-origin requests (all origins in dev)
+- express.json()          → parses JSON request bodies
+- express.static()        → serves /uploads directory publicly
+- authenticate            → JWT verification on all private routes
+- authorize(role)         → RBAC check after authentication
+- upload.single("file")   → multer file handling on upload route
+- handleUploadError       → catches multer-specific errors gracefully
+- rateLimit (on /live)    → 60 requests/minute per IP on public endpoint
+
+9. SCALABILITY APPROACH
+------------------------
+Current (MVP):
+  - Stateless JWT → horizontally scalable (no server-side sessions)
+  - PostgreSQL with connection pooling (pg.Pool)
+  - Local file storage (simple, works for single-instance deployment)
+
+Production Extensions:
+  - Redis caching: cache /content/live responses for 30s-60s
+      → reduces DB load significantly on high-traffic broadcasts
+  - S3 / cloud storage: replace local uploads with AWS S3 or Cloudflare R2
+      → enables multi-instance deployment without shared filesystem
+  - Message queue (Bull/BullMQ + Redis): async approval notifications
+      → notify teachers via email/webhook when content is approved/rejected
+  - Database indexing:
+      → content(uploaded_by, status, start_time, end_time) for live query
+      → content_schedule(slot_id, rotation_order) for scheduling walks
+  - Rate limiting: already applied on public API (express-rate-limit)
+  - Pagination: add LIMIT/OFFSET to all list endpoints for large datasets
+
+================================================================
